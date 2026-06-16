@@ -1,4 +1,3 @@
-```yaml
 name: MitigationBench
 
 on:
@@ -366,4 +365,3 @@ jobs:
             git commit -m "Add MitigationBench results: ${{ needs.validate.outputs.run_label }}"
             git push
           fi
-```
