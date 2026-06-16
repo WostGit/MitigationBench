@@ -1,0 +1,8 @@
+{
+  "status": "placeholder",
+  "reason": "No benchmark runner found yet.",
+  "expected_runner_1": "python package mitigationbench",
+  "expected_runner_2": "scripts/run_benchmark.sh",
+  "commit": "cf597120afcb45d4fc97ea8d131cd9c0d22681de",
+  "workflow_run_id": "27587965300"
+}
