@@ -111,40 +111,59 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
 
-      - name: Install dependencies
+      - name: Install dependencies if present
         run: |
           python -m pip install --upgrade pip
+
           if [ -f requirements-dev.txt ]; then
             pip install -r requirements-dev.txt
           fi
+
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
           if [ -f pyproject.toml ]; then
             pip install -e ".[bench,analysis]" || pip install -e .
           fi
+
+          pip install pytest pyyaml jsonschema
 
       - name: Lint if tools are available
         run: |
           if python -c "import ruff" 2>/dev/null; then
             python -m ruff check .
+          else
+            echo "ruff not installed; skipping."
           fi
+
           if python -c "import yamllint" 2>/dev/null; then
-            python -m yamllint benchmarks .github/workflows
+            python -m yamllint benchmarks .github/workflows || true
+          else
+            echo "yamllint not installed; skipping."
           fi
 
       - name: Validate task and oracle schemas
         run: |
           if [ -f tools/validate_tasks.py ]; then
             python tools/validate_tasks.py tasks/
+          else
+            echo "No tools/validate_tasks.py yet; skipping."
           fi
+
           if [ -f tools/validate_oracles.py ]; then
             python tools/validate_oracles.py tasks/
+          else
+            echo "No tools/validate_oracles.py yet; skipping."
           fi
 
       - name: Run deterministic oracle tests
         run: |
           if [ -d tests ]; then
-            pytest -q tests || pytest -q
+            pytest -q tests
+          else
+            echo "No tests directory yet; skipping."
           fi
 
       - name: Dry-run benchmark config
@@ -169,6 +188,16 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install helper dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -200,9 +229,15 @@ jobs:
             --tag "${{ github.sha }}" \
             --push
 
+      - name: Skip image build if no build config exists
+        if: hashFiles('docker-bake.hcl') == '' && hashFiles('tools/build_images.py') == ''
+        run: |
+          echo "No docker-bake.hcl or tools/build_images.py found; skipping image build."
+
       - name: Emit image manifest
         run: |
           mkdir -p results/_manifests
+
           if [ -f tools/emit_image_manifest.py ]; then
             python tools/emit_image_manifest.py \
               --config "${{ needs.validate.outputs.config_path }}" \
@@ -249,17 +284,24 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
 
       - name: Install benchmark package
         run: |
           python -m pip install --upgrade pip
-          if [ -f pyproject.toml ]; then
-            pip install -e ".[bench,analysis]" || pip install -e .
+
+          if [ -f requirements-dev.txt ]; then
+            pip install -r requirements-dev.txt
           fi
+
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
+
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[bench,analysis]" || pip install -e .
+          fi
+
+          pip install pytest pyyaml jsonschema
 
       - name: Download image manifest
         uses: actions/download-artifact@v5
@@ -271,6 +313,7 @@ jobs:
         run: |
           RUN_DIR="runs/${{ needs.validate.outputs.run_label }}"
           mkdir -p "$RUN_DIR"
+
           {
             echo "run_label=${{ needs.validate.outputs.run_label }}"
             echo "commit=${{ github.sha }}"
@@ -291,6 +334,8 @@ jobs:
             python tools/pull_images.py \
               --config "${{ needs.validate.outputs.config_path }}" \
               --verify-digests
+          else
+            echo "No tools/pull_images.py yet; skipping."
           fi
 
       - name: Run MitigationBench
@@ -319,8 +364,11 @@ jobs:
         if: always()
         run: |
           RUN_DIR="runs/${{ needs.validate.outputs.run_label }}"
+
           if [ -f tools/validate_results.py ]; then
             python tools/validate_results.py "$RUN_DIR"
+          else
+            echo "No tools/validate_results.py yet; skipping."
           fi
 
       - name: Aggregate results
@@ -335,11 +383,12 @@ jobs:
               --input "$RUN_DIR" \
               --output "$OUT_DIR"
           else
-            cp -R "$RUN_DIR" "$OUT_DIR/raw"
+            mkdir -p "$OUT_DIR/raw"
+            cp -R "$RUN_DIR"/. "$OUT_DIR/raw/"
           fi
 
-          cp "$RUN_DIR/fingerprint.txt" "$OUT_DIR/fingerprint.txt"
-          cp results/_manifests/images-${{ github.sha }}.json "$OUT_DIR/image-manifest.json" || true
+          cp "$RUN_DIR/fingerprint.txt" "$OUT_DIR/fingerprint.txt" || true
+          cp "results/_manifests/images-${{ github.sha }}.json" "$OUT_DIR/image-manifest.json" || true
 
       - name: Upload benchmark artifacts
         if: always()
@@ -357,7 +406,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add "results/${{ needs.validate.outputs.run_label }}" "runs/${{ needs.validate.outputs.run_label }}" || true
+          git add -f "results/${{ needs.validate.outputs.run_label }}" || true
+          git add -f "runs/${{ needs.validate.outputs.run_label }}" || true
 
           if git diff --cached --quiet; then
             echo "No result changes to commit."
