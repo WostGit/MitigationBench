@@ -1,0 +1,8 @@
+{
+  "commit": "745247c1eaf06093f0b0d6378211f8bd44b15cfa",
+  "registry": "ghcr.io/WostGit/mitigationbench",
+  "event": "push",
+  "config": "benchmarks/mitigationbench-v1.yaml",
+  "images_built": false,
+  "note": "No tools/emit_image_manifest.py found; generated manifest from workflow."
+}
