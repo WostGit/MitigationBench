@@ -1,0 +1,369 @@
+```yaml
+name: MitigationBench
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_label:
+        description: "Human-readable label for this benchmark run"
+        required: true
+        default: "paper-v1"
+      benchmark_config:
+        description: "Benchmark config path"
+        required: true
+        default: "benchmarks/mitigationbench-v1.yaml"
+      model_group:
+        description: "Model group to run"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - open
+          - closed
+          - paper
+      condition:
+        description: "Experimental condition"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - blind
+          - trace-feedback
+          - mitigation-hint
+          - unmitigated-control
+          - all
+      push_results:
+        description: "Commit results back to repo"
+        required: true
+        default: true
+        type: boolean
+
+  pull_request:
+    branches: [main]
+
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: mitigationbench-${{ github.ref }}-${{ github.event.inputs.run_label || 'ci' }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}/mitigationbench
+  DEFAULT_CONFIG: benchmarks/mitigationbench-v1.yaml
+
+jobs:
+  validate:
+    name: Validate benchmark artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    outputs:
+      config_path: ${{ steps.config.outputs.config_path }}
+      run_label: ${{ steps.config.outputs.run_label }}
+      should_run_benchmark: ${{ steps.mode.outputs.should_run_benchmark }}
+      should_push_results: ${{ steps.mode.outputs.should_push_results }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+
+      - name: Resolve config and mode
+        id: config
+        run: |
+          CONFIG="${{ github.event.inputs.benchmark_config }}"
+          if [ -z "$CONFIG" ]; then
+            CONFIG="${{ env.DEFAULT_CONFIG }}"
+          fi
+
+          LABEL="${{ github.event.inputs.run_label }}"
+          if [ -z "$LABEL" ]; then
+            LABEL="ci-${{ github.run_id }}"
+          fi
+
+          echo "config_path=$CONFIG" >> "$GITHUB_OUTPUT"
+          echo "run_label=$LABEL" >> "$GITHUB_OUTPUT"
+
+      - name: Decide workflow mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_run_benchmark=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run_benchmark=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.push_results }}" = "true" ]; then
+            echo "should_push_results=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_push_results=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements-dev.txt ]; then
+            pip install -r requirements-dev.txt
+          fi
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[bench,analysis]" || pip install -e .
+          fi
+
+      - name: Lint if tools are available
+        run: |
+          if python -c "import ruff" 2>/dev/null; then
+            python -m ruff check .
+          fi
+          if python -c "import yamllint" 2>/dev/null; then
+            python -m yamllint benchmarks .github/workflows
+          fi
+
+      - name: Validate task and oracle schemas
+        run: |
+          if [ -f tools/validate_tasks.py ]; then
+            python tools/validate_tasks.py tasks/
+          fi
+          if [ -f tools/validate_oracles.py ]; then
+            python tools/validate_oracles.py tasks/
+          fi
+
+      - name: Run deterministic oracle tests
+        run: |
+          if [ -d tests ]; then
+            pytest -q tests || pytest -q
+          fi
+
+      - name: Dry-run benchmark config
+        run: |
+          if python -c "import mitigationbench" 2>/dev/null; then
+            python -m mitigationbench benchmark \
+              --config "${{ steps.config.outputs.config_path }}" \
+              --dry-run
+          else
+            echo "Package mitigationbench not importable yet; skipping dry run."
+          fi
+
+  build_images:
+    name: Build and push target images
+    needs: validate
+    if: needs.validate.outputs.should_run_benchmark == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build images from bake file if present
+        if: hashFiles('docker-bake.hcl') != ''
+        uses: docker/bake-action@v6
+        with:
+          files: docker-bake.hcl
+          push: true
+          set: |
+            *.cache-from=type=gha,scope=mitigationbench
+            *.cache-to=type=gha,mode=max,scope=mitigationbench
+            *.tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}:${{ github.sha }}
+
+      - name: Build images from script if present
+        if: hashFiles('docker-bake.hcl') == '' && hashFiles('tools/build_images.py') != ''
+        run: |
+          python tools/build_images.py \
+            --config "${{ needs.validate.outputs.config_path }}" \
+            --registry "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}" \
+            --tag "${{ github.sha }}" \
+            --push
+
+      - name: Emit image manifest
+        run: |
+          mkdir -p results/_manifests
+          if [ -f tools/emit_image_manifest.py ]; then
+            python tools/emit_image_manifest.py \
+              --config "${{ needs.validate.outputs.config_path }}" \
+              --registry "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}" \
+              --tag "${{ github.sha }}" \
+              --output results/_manifests/images-${{ github.sha }}.json
+          else
+            cat > results/_manifests/images-${{ github.sha }}.json <<EOF
+          {
+            "commit": "${{ github.sha }}",
+            "registry": "${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}",
+            "note": "No tools/emit_image_manifest.py found; placeholder manifest generated by CI."
+          }
+          EOF
+          fi
+
+      - name: Upload image manifest
+        uses: actions/upload-artifact@v5
+        with:
+          name: image-manifest-${{ github.sha }}
+          path: results/_manifests/images-${{ github.sha }}.json
+          retention-days: 90
+
+  benchmark:
+    name: Run benchmark
+    needs: [validate, build_images]
+    if: needs.validate.outputs.should_run_benchmark == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install benchmark package
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[bench,analysis]" || pip install -e .
+          fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Download image manifest
+        uses: actions/download-artifact@v5
+        with:
+          name: image-manifest-${{ github.sha }}
+          path: results/_manifests
+
+      - name: Record run fingerprint
+        run: |
+          RUN_DIR="runs/${{ needs.validate.outputs.run_label }}"
+          mkdir -p "$RUN_DIR"
+          {
+            echo "run_label=${{ needs.validate.outputs.run_label }}"
+            echo "commit=${{ github.sha }}"
+            echo "workflow_run_id=${{ github.run_id }}"
+            echo "workflow_run_number=${{ github.run_number }}"
+            echo "config=${{ needs.validate.outputs.config_path }}"
+            echo "model_group=${{ github.event.inputs.model_group }}"
+            echo "condition=${{ github.event.inputs.condition }}"
+            echo "runner_os=${{ runner.os }}"
+            echo "date_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            uname -a
+            docker version || true
+          } > "$RUN_DIR/fingerprint.txt"
+
+      - name: Pull pinned images if tool exists
+        run: |
+          if [ -f tools/pull_images.py ]; then
+            python tools/pull_images.py \
+              --config "${{ needs.validate.outputs.config_path }}" \
+              --verify-digests
+          fi
+
+      - name: Run MitigationBench
+        run: |
+          RUN_DIR="runs/${{ needs.validate.outputs.run_label }}"
+
+          if python -c "import mitigationbench" 2>/dev/null; then
+            python -m mitigationbench benchmark \
+              --config "${{ needs.validate.outputs.config_path }}" \
+              --model-group "${{ github.event.inputs.model_group }}" \
+              --condition "${{ github.event.inputs.condition }}" \
+              --output "$RUN_DIR"
+          elif [ -f scripts/run_benchmark.sh ]; then
+            bash scripts/run_benchmark.sh \
+              "${{ needs.validate.outputs.config_path }}" \
+              "${{ github.event.inputs.model_group }}" \
+              "${{ github.event.inputs.condition }}" \
+              "$RUN_DIR"
+          else
+            echo "No benchmark runner found."
+            echo "Expected either python package 'mitigationbench' or scripts/run_benchmark.sh."
+            exit 1
+          fi
+
+      - name: Validate benchmark results
+        if: always()
+        run: |
+          RUN_DIR="runs/${{ needs.validate.outputs.run_label }}"
+          if [ -f tools/validate_results.py ]; then
+            python tools/validate_results.py "$RUN_DIR"
+          fi
+
+      - name: Aggregate results
+        if: always()
+        run: |
+          RUN_DIR="runs/${{ needs.validate.outputs.run_label }}"
+          OUT_DIR="results/${{ needs.validate.outputs.run_label }}"
+          mkdir -p "$OUT_DIR"
+
+          if [ -f analysis/aggregate.py ]; then
+            python analysis/aggregate.py \
+              --input "$RUN_DIR" \
+              --output "$OUT_DIR"
+          else
+            cp -R "$RUN_DIR" "$OUT_DIR/raw"
+          fi
+
+          cp "$RUN_DIR/fingerprint.txt" "$OUT_DIR/fingerprint.txt"
+          cp results/_manifests/images-${{ github.sha }}.json "$OUT_DIR/image-manifest.json" || true
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: mitigationbench-results-${{ needs.validate.outputs.run_label }}-${{ github.run_id }}
+          path: |
+            runs/${{ needs.validate.outputs.run_label }}
+            results/${{ needs.validate.outputs.run_label }}
+          retention-days: 365
+
+      - name: Commit results back to repository
+        if: always() && needs.validate.outputs.should_push_results == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "results/${{ needs.validate.outputs.run_label }}" "runs/${{ needs.validate.outputs.run_label }}" || true
+
+          if git diff --cached --quiet; then
+            echo "No result changes to commit."
+          else
+            git commit -m "Add MitigationBench results: ${{ needs.validate.outputs.run_label }}"
+            git push
+          fi
+```
